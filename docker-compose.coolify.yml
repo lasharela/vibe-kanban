@@ -1,0 +1,83 @@
+# Coolify-native production compose for the vibe-kanban remote/team server.
+# Differences vs crates/remote/docker-compose.yml (dev):
+#   - No `ssh: default` build mount  -> Coolify's BuildKit has no agent; with FEATURES="" the
+#     Dockerfile strips the private billing crate, so SSH is never needed.
+#   - No Caddy service               -> Coolify's Traefik terminates TLS and routes the domain.
+#   - Build context "."              -> compose lives at repo root, so no `../..` parent-path issue.
+#   - Postgres has NO host port      -> internal-only on the Coolify network.
+#   - Secrets come from Coolify env  -> only ${VAR} references here, never literals.
+services:
+  remote-db:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_DB: remote
+      POSTGRES_USER: remote
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-remote}
+    volumes:
+      - remote-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U remote -d remote"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  remote-server:
+    build:
+      context: .
+      dockerfile: crates/remote/Dockerfile
+      args:
+        FEATURES: ""
+        VITE_RELAY_API_BASE_URL: ${VITE_RELAY_API_BASE_URL:-}
+    depends_on:
+      remote-db:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info,remote=info
+      SERVER_DATABASE_URL: postgres://remote:${DB_PASSWORD:-remote}@remote-db:5432/remote
+      SERVER_LISTEN_ADDR: 0.0.0.0:8081
+      ELECTRIC_URL: http://electric:3000
+      ELECTRIC_ROLE_PASSWORD: ${ELECTRIC_ROLE_PASSWORD:-remote}
+      SERVER_PUBLIC_BASE_URL: https://${DOMAIN}
+      VIBEKANBAN_REMOTE_JWT_SECRET: ${VIBEKANBAN_REMOTE_JWT_SECRET}
+      # Auth: local bootstrap admin (for migration) + Google OAuth (for the team)
+      SELF_HOST_LOCAL_AUTH_EMAIL: ${SELF_HOST_LOCAL_AUTH_EMAIL:-}
+      SELF_HOST_LOCAL_AUTH_PASSWORD: ${SELF_HOST_LOCAL_AUTH_PASSWORD:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8081/v1/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  electric:
+    image: electricsql/electric:1.4.13
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgresql://electric_sync:${ELECTRIC_ROLE_PASSWORD:-remote}@remote-db:5432/remote?sslmode=disable
+      PG_PROXY_PORT: 65432
+      LOGICAL_PUBLISHER_HOST: electric
+      AUTH_MODE: insecure
+      ELECTRIC_INSECURE: "true"
+      ELECTRIC_MANUAL_TABLE_PUBLISHING: "true"
+      ELECTRIC_USAGE_REPORTING: "false"
+      ELECTRIC_FEATURE_FLAGS: allow_subqueries,tagged_subqueries
+    volumes:
+      - electric-data:/app/persistent
+    depends_on:
+      remote-db:
+        condition: service_healthy
+      remote-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  remote-db-data:
+  electric-data:
